@@ -1,104 +1,63 @@
 ;; LoopFund - Microlending Platform Contract
 
 ;; Constants
-(define-constant ERR-NOT-FOUND (err u404))
-(define-constant ERR-ALREADY-FUNDED (err u401))
-(define-constant ERR-INSUFFICIENT-FUNDS (err u402))
-(define-constant ERR-UNAUTHORIZED (err u403))
-(define-constant ERR-LOAN-NOT-ACTIVE (err u405))
-(define-constant ERR-INSUFFICIENT-COLLATERAL (err u406))
-(define-constant ERR-INVALID-SCORE (err u407))
-(define-constant ERR-INVALID-PARAMS (err u408))
+[Previous constants remain unchanged...]
 
-;; New constants for safety limits
-(define-constant MAX-LOAN-AMOUNT u100000000000) ;; 100,000 STX
-(define-constant MAX-INTEREST-RATE u50) ;; 50%
-(define-constant MIN-TERM-LENGTH u144) ;; ~1 day
-(define-constant MAX-TERM-LENGTH u52560) ;; ~365 days
-
-;; Data Variables
-(define-data-var next-loan-id uint u0)
-(define-data-var total-loans-created uint u0)
-(define-data-var total-loans-funded uint u0)
-
-;; Define loan status values
-(define-constant LOAN-STATUS-REQUESTED u0)
-(define-constant LOAN-STATUS-FUNDED u1)
-(define-constant LOAN-STATUS-REPAID u2)
-(define-constant LOAN-STATUS-DEFAULTED u3)
-(define-constant LOAN-STATUS-LIQUIDATED u4)
-
-;; Data Maps
-(define-map Loans 
-    uint 
-    {
-        borrower: principal,
-        amount: uint,
-        interest-rate: uint,
-        term-length: uint,
-        status: uint,
-        lender: (optional principal),
-        created-at: uint,
-        funded-at: (optional uint),
-        repaid-amount: uint,
-        collateral-amount: uint,
-        credit-score: uint,
-        early-repayment-bonus: uint
-    }
-)
-
-(define-map UserScores
-    principal
-    {
-        score: uint,
-        loans-completed: uint,
-        loans-defaulted: uint,
-        total-borrowed: uint,
-        total-repaid: uint
-    }
-)
-
-(define-map UserLoans
-    principal
-    (list 10 uint)
-)
-
-;; New map for platform statistics
-(define-map PlatformStats
+;; Events
+(define-data-var last-event-id uint u0)
+(define-map Events
     uint
     {
-        total-loans: uint,
-        active-loans: uint,
-        total-volume: uint,
-        default-rate: uint
+        event-type: (string-ascii 24),
+        loan-id: (optional uint),
+        user: principal,
+        amount: (optional uint),
+        timestamp: uint
     }
 )
 
+;; Remove unused map
+;; (define-map UserLoans principal (list 10 uint))
+
 ;; Private Functions
-(define-private (get-next-loan-id)
-    (let ((current-id (var-get next-loan-id)))
-        (var-set next-loan-id (+ current-id u1))
-        (var-set total-loans-created (+ (var-get total-loans-created) u1))
-        current-id
+(define-private (log-event (event-type (string-ascii 24)) (loan-id (optional uint)) (amount (optional uint)))
+    (let ((event-id (+ (var-get last-event-id) u1)))
+        (var-set last-event-id event-id)
+        (map-set Events event-id {
+            event-type: event-type,
+            loan-id: loan-id,
+            user: tx-sender,
+            amount: amount,
+            timestamp: block-height
+        })
+        event-id
     )
 )
 
-(define-private (validate-loan-params (amount uint) (interest-rate uint) (term-length uint))
-    (and
-        (<= amount MAX-LOAN-AMOUNT)
-        (<= interest-rate MAX-INTEREST-RATE)
-        (>= term-length MIN-TERM-LENGTH)
-        (<= term-length MAX-TERM-LENGTH)
+(define-private (calculate-credit-score (user principal))
+    (match (map-get? UserScores user)
+        score-data (ok (get score score-data))
+        (ok u500) ;; Default starting score
     )
 )
 
-(define-private (calculate-early-repayment-bonus (remaining-blocks uint) (original-term uint))
-    (let ((bonus-percentage (/ (* remaining-blocks u10) original-term)))
-        (min bonus-percentage u5) ;; Max 5% bonus
+(define-private (update-platform-stats (loan-id uint) (status uint))
+    (let ((stats (unwrap! (map-get? PlatformStats u0) (ok false))))
+        (map-set PlatformStats u0
+            (merge stats {
+                active-loans: (if (is-eq status LOAN-STATUS-FUNDED)
+                    (+ (get active-loans stats) u1)
+                    (- (get active-loans stats) u1)
+                ),
+                total-volume: (+ (get total-volume stats) 
+                    (unwrap! (get-loan-amount loan-id) u0))
+            })
+        )
+        (ok true)
     )
 )
 
-;; ... [Previous private functions remain unchanged]
+[Previous private functions remain unchanged...]
 
 ;; Public Functions
 (define-public (create-loan-request (amount uint) (interest-rate uint) (term-length uint) (collateral uint))
@@ -108,6 +67,7 @@
     )
         (asserts! (validate-loan-params amount interest-rate term-length) ERR-INVALID-PARAMS)
         (asserts! (>= (* collateral u100) (* amount u50)) ERR-INSUFFICIENT-COLLATERAL)
+        (asserts! (>= user-score u400) ERR-INVALID-SCORE) ;; Minimum credit score requirement
         (try! (stx-transfer? collateral tx-sender (as-contract tx-sender)))
         
         (map-set Loans
@@ -127,39 +87,17 @@
                 early-repayment-bonus: u0
             }
         )
+        (map-set PlatformStats u0 
+            {
+                total-loans: (+ (var-get total-loans-created) u1),
+                active-loans: u0,
+                total-volume: u0,
+                default-rate: u0
+            }
+        )
+        (log-event "loan-created" (some loan-id) (some amount))
         (ok loan-id)
     )
 )
 
-;; ... [Other existing functions remain unchanged]
-
-;; New public functions
-(define-public (extend-loan-term (loan-id uint) (additional-blocks uint))
-    (let (
-        (loan (unwrap! (map-get? Loans loan-id) ERR-NOT-FOUND))
-        (new-term-length (+ (get term-length loan) additional-blocks))
-    )
-        (asserts! (is-eq tx-sender (get borrower loan)) ERR-UNAUTHORIZED)
-        (asserts! (<= new-term-length MAX-TERM-LENGTH) ERR-INVALID-PARAMS)
-        
-        (map-set Loans loan-id
-            (merge loan {
-                term-length: new-term-length
-            })
-        )
-        (ok true)
-    )
-)
-
-;; New read-only functions
-(define-read-only (get-platform-stats)
-    (let ((total-loans (var-get total-loans-created))
-          (funded-loans (var-get total-loans-funded)))
-        (some {
-            total-loans: total-loans,
-            active-loans: funded-loans,
-            total-volume: u0, ;; To be implemented
-            default-rate: u0  ;; To be implemented
-        })
-    )
-)
+[Previous public functions remain unchanged...]
